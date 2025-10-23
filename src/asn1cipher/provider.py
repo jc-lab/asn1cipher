@@ -205,8 +205,8 @@ class Provider:
 
     def _get_algorithm(self, enc_algo: EncryptionAlgorithm) -> Tuple[str, Optional[CustomAlgorithm]]:
         oid = str(enc_algo["algorithm"])
-        custom_algorithm = self._custom_algorithms[oid]
-        if custom_algorithm is not None:
+        if oid in self._custom_algorithms:
+            custom_algorithm = self._custom_algorithms[oid]
             return custom_algorithm.name, custom_algorithm
         algo_name = enc_algo["algorithm"].native
         return algo_name, None
