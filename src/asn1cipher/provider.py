@@ -1,8 +1,9 @@
 from typing import Optional, Dict, Callable, Tuple
+from abc import ABC
 
 from asn1crypto.algos import EncryptionAlgorithm, Pbes1Params, Pbkdf2Params
 from asn1crypto.cms import EncryptedContentInfo
-from asn1crypto.core import OctetString
+from asn1crypto.core import OctetString, Any
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -20,6 +21,21 @@ from .block_mode import ECB, CBC
 from .rc2_cipher import RC2Cipher
 from .cipher_adapter import TripleDESCipher, AESCipher
 
+class CustomAlgorithm(ABC):
+    @property
+    def name(self) -> str:
+        ...
+
+    def pre_derive_key_and_iv(
+            self, password: str, enc_algo: EncryptionAlgorithm
+    ) -> Tuple[bytes, Optional[bytes]] | None:
+        return None
+
+    def post_derive_key_and_iv(
+            self, password: str, enc_algo: EncryptionAlgorithm, key: bytes, iv: bytes
+    ) -> Tuple[bytes, Optional[bytes]] | None:
+        return None
+
 class Provider:
     """
     Encryption/Decryption Provider class
@@ -34,9 +50,17 @@ class Provider:
 
     def __init__(self) -> None:
         """Initialize Provider"""
+        self._custom_algorithms: Dict[str, CustomAlgorithm] = {}
         # Cipher factory: cipher name -> BlockCipher creation function
         self._cipher_factories: Dict[str, Callable[[bytes], BlockCipher]] = {}
         self._register_cipher_factories()
+
+    def register_algorithm(
+        self,
+        oid: str,
+        algorithm: CustomAlgorithm
+    ) -> None:
+        self._custom_algorithms[oid] = algorithm
 
     def register_cipher_factory(
         self, cipher_name: str, factory: Callable[[bytes], BlockCipher]
@@ -69,16 +93,17 @@ class Provider:
             InvalidPasswordError: Invalid password
         """
         enc_algo = encrypted_content_info["content_encryption_algorithm"]
+        algo_name, custom_algorithm = self._get_algorithm(enc_algo)
         encrypted_content = encrypted_content_info["encrypted_content"]
 
         if encrypted_content is None:
             raise DecryptionError("No encrypted content")
         
         # Derive key and IV
-        key, iv = self._derive_key_and_iv(password, enc_algo)
+        key, iv = self._derive_key_and_iv(algo_name, enc_algo, custom_algorithm, password)
 
         # Determine cipher algorithm and mode
-        cipher_algo, mode_name = self._get_cipher_and_mode(enc_algo)
+        cipher_algo, mode_name = self._get_cipher_and_mode(algo_name, enc_algo)
 
         # Decrypt
         try:
@@ -109,9 +134,12 @@ class Provider:
             UnsupportedAlgorithmError: Unsupported algorithm
             EncryptionError: Encryption failure
         """
+
+        algo_name, custom_algorithm = self._get_algorithm(encryption_algorithm)
+
         try:
             # Derive key and IV
-            key, iv = self._derive_key_and_iv(password, encryption_algorithm)
+            key, iv = self._derive_key_and_iv(algo_name, encryption_algorithm, custom_algorithm, password)
             
             # Determine cipher algorithm and mode
             cipher_algo, mode_name = self._get_cipher_and_mode(encryption_algorithm)
@@ -139,37 +167,52 @@ class Provider:
         self.register_cipher_factory("aes", AESCipher)
 
     def _derive_key_and_iv(
-        self, password: str, enc_algo: EncryptionAlgorithm
+        self, algo_name: str, enc_algo: EncryptionAlgorithm, custom_algorithm: Optional[CustomAlgorithm], password: str
     ) -> Tuple[bytes, Optional[bytes]]:
         """
         Derive key and IV
-        
-        Args:
-            password: Password
-            enc_algo: Encryption algorithm
-            
+
         Returns:
             (key, iv) tuple
         """
-        algo_name = enc_algo["algorithm"].native
-        
+
+        if custom_algorithm is not None:
+            result = custom_algorithm.pre_derive_key_and_iv(password, enc_algo)
+            if result is not None:
+                return result
+
         # PBES1 algorithm
         if algo_name.startswith("pbes1_"):
-            return self._derive_pbes1(password, enc_algo)
+            key, iv = self._derive_pbes1(password, algo_name, enc_algo)
         
         # PBES2 algorithm
         elif algo_name == "pbes2":
-            return self._derive_pbes2(password, enc_algo)
+            key, iv = self._derive_pbes2(password, algo_name, enc_algo)
         
         # PKCS12 algorithm
         elif algo_name.startswith("pkcs12_"):
-            return self._derive_pkcs12(password, enc_algo)
+            key, iv = self._derive_pkcs12(password, algo_name, enc_algo)
         
         else:
             raise ValueError(f"unknown algorithm: {enc_algo['algorithm']}")
 
+        if custom_algorithm is not None:
+            result = custom_algorithm.post_derive_key_and_iv(password, enc_algo, key, iv)
+            if result is not None:
+                return result
+
+        return key, iv
+
+    def _get_algorithm(self, enc_algo: EncryptionAlgorithm) -> Tuple[str, Optional[CustomAlgorithm]]:
+        oid = str(enc_algo["algorithm"])
+        custom_algorithm = self._custom_algorithms[oid]
+        if custom_algorithm is not None:
+            return custom_algorithm.name, custom_algorithm
+        algo_name = enc_algo["algorithm"].native
+        return algo_name, None
+
     def _get_cipher_and_mode(
-        self, enc_algo: EncryptionAlgorithm
+        self, algo_name: str, enc_algo: EncryptionAlgorithm
     ) -> Tuple[str, str]:
         """
         Determine cipher algorithm and mode
@@ -180,8 +223,7 @@ class Provider:
         Returns:
             (cipher_algo, mode_name) tuple
         """
-        algo_name = enc_algo["algorithm"].native
-        
+
         # PBES1: pbes1_{hash}_{cipher}
         if algo_name.startswith("pbes1_"):
             _, hash_algo, cipher_algo = algo_name.split("_", 2)
@@ -212,11 +254,12 @@ class Provider:
     # ===== Key derivation functions =====
 
     def _derive_pbes1(
-        self, password: str, enc_algo: EncryptionAlgorithm
+        self, password: str, algo_name: str, enc_algo: EncryptionAlgorithm | Any
     ) -> Tuple[bytes, bytes]:
         """Derive PBES1 key and IV"""
-        algo_name = enc_algo["algorithm"].native
         params = enc_algo["parameters"]
+        if isinstance(params, Any):
+            params = params.parse(Pbes1Params)
         
         salt = params["salt"].native
         iterations = params["iterations"].native
@@ -235,7 +278,7 @@ class Provider:
         return (key, iv)
 
     def _derive_pbes2(
-        self, password: str, enc_algo: EncryptionAlgorithm
+        self, password: str, algo_name: str, enc_algo: EncryptionAlgorithm
     ) -> Tuple[bytes, Optional[bytes]]:
         """
         PBES2 키와 IV 파생
@@ -255,7 +298,7 @@ class Provider:
         return (key, iv)
 
     def _derive_pkcs12(
-        self, password: str, enc_algo: EncryptionAlgorithm
+        self, password: str, algo_name: str, enc_algo: EncryptionAlgorithm
     ) -> Tuple[bytes, Optional[bytes]]:
         """Derive PKCS#12 key and IV"""
         algo_name = enc_algo["algorithm"].native
