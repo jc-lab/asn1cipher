@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asn1cipher"
-version = "0.1.0"
+version = "{{VERSION_PLACEHOLDER}}"
 description = "A Python library for encrypting and decrypting ASN.1 encrypted content."
 readme = "README.md"
 requires-python = ">=3.8"
