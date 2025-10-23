@@ -74,4 +74,4 @@ Contributions are welcome! Please submit a Pull Request.
 
 ## Author
 
-Your Name <your.email@example.com>
+joseph@jc-lab.net
