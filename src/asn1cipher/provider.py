@@ -18,8 +18,7 @@ from .exceptions import (
 from .cipher import Cipher
 from .block_cipher import BlockCipher
 from .block_mode import ECB, CBC
-from .rc2_cipher import RC2Cipher
-from .cipher_adapter import TripleDESCipher, AESCipher
+from .cipher_algorithm import CipherAlgorithm, DESCipherAlgorithm, TripleDESCipherAlgorithm, RC2CipherAlgorithm, AESCipherAlgorithm
 
 class CustomAlgorithm(ABC):
     @property
@@ -51,9 +50,8 @@ class Provider:
     def __init__(self) -> None:
         """Initialize Provider"""
         self._custom_algorithms: Dict[str, CustomAlgorithm] = {}
-        # Cipher factory: cipher name -> BlockCipher creation function
-        self._cipher_factories: Dict[str, Callable[[bytes], BlockCipher]] = {}
-        self._register_cipher_factories()
+        self._cipher_algorithms: Dict[str, CipherAlgorithm] = {}
+        self._register_cipher_algoritms()
 
     def register_algorithm(
         self,
@@ -62,17 +60,12 @@ class Provider:
     ) -> None:
         self._custom_algorithms[oid] = algorithm
 
-    def register_cipher_factory(
-        self, cipher_name: str, factory: Callable[[bytes], BlockCipher]
+    def register_cipher_algorithm(
+            self,
+            oid: str,
+            algorithm: CipherAlgorithm
     ) -> None:
-        """
-        Register Cipher factory
-        
-        Args:
-            cipher_name: Cipher name (e.g., "rc2", "aes", "tripledes")
-            factory: BlockCipher creation function (key) -> BlockCipher
-        """
-        self._cipher_factories[cipher_name] = factory
+        self._cipher_algorithms[oid] = algorithm
 
     def decrypt(
         self, encrypted_content_info: EncryptedContentInfo, password: str
@@ -98,12 +91,12 @@ class Provider:
 
         if encrypted_content is None:
             raise DecryptionError("No encrypted content")
-        
-        # Derive key and IV
-        key, iv = self._derive_key_and_iv(algo_name, enc_algo, custom_algorithm, password)
 
         # Determine cipher algorithm and mode
         cipher_algo, mode_name = self._get_cipher_and_mode(algo_name, enc_algo)
+
+        # Derive key and IV
+        key, iv = self._derive_key_and_iv(algo_name, enc_algo, custom_algorithm, cipher_algo, password)
 
         # Decrypt
         try:
@@ -159,15 +152,20 @@ class Provider:
                 raise
             raise EncryptionError(f"Error during encryption: {e}") from e
 
-    def _register_cipher_factories(self) -> None:
-        """Register default Cipher factories"""
-        self.register_cipher_factory("des", lambda key: TripleDESCipher(key))
-        self.register_cipher_factory("tripledes", TripleDESCipher)
-        self.register_cipher_factory("rc2", RC2Cipher)
-        self.register_cipher_factory("aes", AESCipher)
+    def _register_cipher_algoritms(self) -> None:
+        """Register default Cipher algorithms"""
+        self.register_cipher_algorithm("des", DESCipherAlgorithm())
+        self.register_cipher_algorithm("tripledes", TripleDESCipherAlgorithm())
+        self.register_cipher_algorithm("rc2", RC2CipherAlgorithm())
+        self.register_cipher_algorithm("aes", AESCipherAlgorithm())
 
     def _derive_key_and_iv(
-        self, algo_name: str, enc_algo: EncryptionAlgorithm, custom_algorithm: Optional[CustomAlgorithm], password: str
+            self,
+            algo_name: str,
+            enc_algo: EncryptionAlgorithm,
+            custom_algorithm: Optional[CustomAlgorithm],
+            cipher_algorithm: CipherAlgorithm,
+            password: str,
     ) -> Tuple[bytes, Optional[bytes]]:
         """
         Derive key and IV
@@ -187,7 +185,7 @@ class Provider:
         
         # PBES2 algorithm
         elif algo_name == "pbes2":
-            key, iv = self._derive_pbes2(password, algo_name, enc_algo)
+            key, iv = self._derive_pbes2(password, algo_name, enc_algo, cipher_algorithm)
         
         # PKCS12 algorithm
         elif algo_name.startswith("pkcs12_"):
@@ -211,6 +209,17 @@ class Provider:
         algo_name = enc_algo["algorithm"].native
         return algo_name, None
 
+    def _find_cipher_algorithm(self, oid: str) -> Optional[CipherAlgorithm]:
+        if oid in self._cipher_algorithms:
+            return self._cipher_algorithms[oid]
+        raise None
+
+    def _get_cipher_algorithm(self, oid: str) -> CipherAlgorithm:
+        algo = self._find_cipher_algorithm(oid)
+        if algo is None:
+            raise ValueError(f"unknown algorithm: {oid}")
+        return algo
+
     def _get_cipher_and_mode(
         self, algo_name: str, enc_algo: EncryptionAlgorithm
     ) -> Tuple[str, str]:
@@ -227,14 +236,17 @@ class Provider:
         # PBES1: pbes1_{hash}_{cipher}
         if algo_name.startswith("pbes1_"):
             _, hash_algo, cipher_algo = algo_name.split("_", 2)
-            return (cipher_algo, "cbc")
+            return (self._get_cipher_algorithm(cipher_algo), "cbc")
         
         # PBES2
         elif algo_name == "pbes2":
             encryption_scheme = enc_algo["parameters"]["encryption_scheme"]
-            cipher_algo = encryption_scheme.encryption_cipher
-            mode = encryption_scheme.encryption_mode
-            return (cipher_algo, mode)
+
+            cipher_algorithm = self._find_cipher_algorithm(str(encryption_scheme['algorithm']))
+            if cipher_algorithm is not None:
+                return cipher_algorithm, cipher_algorithm.block_mode
+
+            return (self._get_cipher_algorithm(encryption_scheme.encryption_cipher), encryption_scheme.encryption_mode)
         
         # PKCS12: pkcs12_sha1_{cipher}_{keysize}
         elif algo_name.startswith("pkcs12_"):
@@ -242,14 +254,12 @@ class Provider:
             cipher_algo = parts[2]
             # Normalize tripledes to "tripledes"
             if cipher_algo == "tripledes":
-                return ("tripledes", "cbc")
-            return (cipher_algo, "cbc")
+                return (self._get_cipher_algorithm("tripledes"), "cbc")
+            return (self._get_cipher_algorithm(cipher_algo), "cbc")
         
         # Direct encryption
         else:
-            cipher_algo = enc_algo.encryption_cipher
-            mode = enc_algo.encryption_mode
-            return (cipher_algo, mode)
+            return (self._get_cipher_algorithm(enc_algo.encryption_cipher), enc_algo.encryption_mode)
 
     # ===== Key derivation functions =====
 
@@ -278,7 +288,7 @@ class Provider:
         return (key, iv)
 
     def _derive_pbes2(
-        self, password: str, algo_name: str, enc_algo: EncryptionAlgorithm
+        self, password: str, algo_name: str, enc_algo: EncryptionAlgorithm, cipher_algo: CipherAlgorithm
     ) -> Tuple[bytes, Optional[bytes]]:
         """
         PBES2 키와 IV 파생
@@ -288,13 +298,13 @@ class Provider:
         params = enc_algo["parameters"]
         kdf_algo = params["key_derivation_func"]
         encryption_scheme = params["encryption_scheme"]
-        
+
         # Derive key with KDF
-        key = self._derive_key_pbkdf2(password.encode("utf-8"), kdf_algo, encryption_scheme)
-        
+        key = self._derive_key_pbkdf2(password.encode("utf-8"), kdf_algo, encryption_scheme, cipher_algo)
+
         # Get IV from encryption_scheme
-        iv = encryption_scheme.encryption_iv
-        
+        iv = cipher_algo.get_iv(encryption_scheme)
+
         return (key, iv)
 
     def _derive_pkcs12(
@@ -374,6 +384,7 @@ class Provider:
         password: bytes,
         kdf_algo: EncryptionAlgorithm,
         encryption_scheme: EncryptionAlgorithm,
+        cipher_algorithm: CipherAlgorithm,
     ) -> bytes:
         """Derive key with PBKDF2"""
         kdf_name = kdf_algo["algorithm"].native
@@ -407,11 +418,13 @@ class Provider:
             raise UnsupportedAlgorithmError(f"Unsupported PRF: {prf_algo}")
         
         # Key length
-        key_length = params["key_length"]
-        if key_length is None or key_length.native is None:
-            key_length = encryption_scheme.key_length
-        else:
-            key_length = key_length.native
+        key_length = cipher_algorithm.override_key_size()
+        if key_length <= 0:
+            key_length = params["key_length"]
+            if key_length is None or key_length.native is None:
+                key_length = encryption_scheme.key_length
+            else:
+                key_length = key_length.native
         
         # Derive key with PBKDF2
         kdf = PBKDF2HMAC(
@@ -538,13 +551,13 @@ class Provider:
         ciphertext: bytes,
         key: bytes,
         iv: Optional[bytes],
-        cipher_algo: str,
+        cipher_algo: CipherAlgorithm,
         mode_name: str,
     ) -> bytes:
         """Decrypt with specified cipher and mode"""
         # Create BlockCipher
-        block_cipher = self._create_block_cipher(key, cipher_algo)
-        
+        block_cipher = cipher_algo.create(key)
+
         # Create BlockMode
         block_mode = self._create_block_mode(mode_name, iv, block_cipher.block_size)
         
@@ -559,12 +572,12 @@ class Provider:
         plaintext: bytes,
         key: bytes,
         iv: Optional[bytes],
-        cipher_algo: str,
+        cipher_algo: CipherAlgorithm,
         mode_name: str,
     ) -> bytes:
         """Encrypt with specified cipher and mode"""
         # Create BlockCipher
-        block_cipher = self._create_block_cipher(key, cipher_algo)
+        block_cipher = cipher_algo.create(key)
         
         # Create BlockMode
         block_mode = self._create_block_mode(mode_name, iv, block_cipher.block_size)
@@ -575,13 +588,6 @@ class Provider:
         # Encrypt
         return cipher.encrypt(plaintext, padding=True)
 
-    def _create_block_cipher(self, key: bytes, cipher_algo: str) -> BlockCipher:
-        """Create BlockCipher object"""
-        factory = self._cipher_factories.get(cipher_algo)
-        if factory is None:
-            raise UnsupportedAlgorithmError(f"Unsupported cipher: {cipher_algo}")
-        return factory(key)
-    
     def _create_block_mode(self, mode_name: str, iv: Optional[bytes], block_size: int):
         """Create BlockMode object"""
         if mode_name == "ecb":
